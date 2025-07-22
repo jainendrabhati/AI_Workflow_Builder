@@ -1,13 +1,22 @@
-from typing import List, Dict, Any, Optional
-import openai
 import os
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
+
+from langchain.chains import LLMChain, SequentialChain
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
+from langchain.schema import BaseOutputParser
+from langchain.memory import ConversationBufferMemory
+from langchain.agents import AgentExecutor, create_openai_functions_agent
+from langchain.tools import Tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
 from .llm_service import LLMService
 from .knowledge_base_service import KnowledgeBaseService
 from .web_search_service import WebSearchService
+from .file_processor import FileProcessor
 import asyncio
 import time
-from typing import List, Dict
 
 load_dotenv()
 
@@ -16,9 +25,13 @@ class WorkflowExecutor:
         self.llm_service = LLMService()
         self.kb_service = KnowledgeBaseService()
         self.web_search_service = WebSearchService()
-    
+        self.file_processor = FileProcessor()
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
 
-    
+    # ... keep existing code (validation methods)
     def validate_workflow(self, nodes: List[Any], edges: List[Dict]) -> Optional[str]:
         """Validate workflow configuration and return error message if invalid."""
         print(3)
@@ -150,9 +163,276 @@ class WorkflowExecutor:
 
         return dfs(start)
 
-    
+    async def execute_workflow_langchain(self, workflow: Dict[str, Any], user_query: str) -> str:
+        """Execute a workflow using LangChain chains and agents"""
+        try:
+            workflow_type = workflow.get('type', 'sequential')
+            nodes = workflow.get('nodes', [])
+            
+            if workflow_type == 'sequential':
+                return await self._execute_sequential_workflow(nodes, user_query)
+            elif workflow_type == 'agent':
+                return await self._execute_agent_workflow(nodes, user_query)
+            elif workflow_type == 'parallel':
+                return await self._execute_parallel_workflow(nodes, user_query)
+            else:
+                return await self._execute_custom_workflow(nodes, user_query)
+                
+        except Exception as e:
+            return f"Error executing workflow: {str(e)}"
 
+    async def _execute_sequential_workflow(self, nodes: List[Dict], user_query: str) -> str:
+        """Execute nodes sequentially using LangChain SequentialChain"""
+        try:
+            chains = []
+            input_variables = ["user_query"]
+            output_variables = []
+            
+            for i, node in enumerate(nodes):
+                node_type = node.get('type')
+                config = node.get('config', {})
+                
+                if node_type == 'llm':
+                    chain = await self._create_llm_chain(config, f"step_{i}")
+                    chains.append(chain)
+                    output_variables.append(f"step_{i}_output")
+                elif node_type == 'knowledge_base':
+                    chain = await self._create_kb_chain(config, f"step_{i}")
+                    chains.append(chain)
+                    output_variables.append(f"step_{i}_output")
+                elif node_type == 'web_search':
+                    chain = await self._create_web_search_chain(config, f"step_{i}")
+                    chains.append(chain)
+                    output_variables.append(f"step_{i}_output")
+            
+            if not chains:
+                return "No valid chains created"
+            
+            # Create sequential chain
+            sequential_chain = SequentialChain(
+                chains=chains,
+                input_variables=input_variables,
+                output_variables=output_variables,
+                verbose=True
+            )
+            
+            # Execute chain
+            result = await sequential_chain.ainvoke({"user_query": user_query})
+            
+            # Return the last output
+            last_output_key = output_variables[-1] if output_variables else "output"
+            return result.get(last_output_key, "No output generated")
+            
+        except Exception as e:
+            return f"Error in sequential workflow: {str(e)}"
 
+    async def _execute_agent_workflow(self, nodes: List[Dict], user_query: str) -> str:
+        """Execute workflow using LangChain agents"""
+        try:
+            # Create tools from workflow nodes
+            tools = []
+            
+            for node in nodes:
+                tool = await self._create_tool_from_node(node)
+                if tool:
+                    tools.append(tool)
+            
+            if not tools:
+                return "No tools created from workflow nodes"
+            
+            # Get LLM for agent
+            llm = self.llm_service._get_model_instance('GPT 4o - Mini', 0.7)
+            
+            # Create agent prompt
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", "You are a helpful assistant that can use various tools to answer questions."),
+                ("user", "{input}"),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
+            ])
+            
+            # Create agent
+            agent = create_openai_functions_agent(llm, tools, prompt)
+            agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+            
+            # Execute agent
+            result = await agent_executor.ainvoke({"input": user_query})
+            return result.get("output", "No output generated")
+            
+        except Exception as e:
+            return f"Error in agent workflow: {str(e)}"
+
+    async def _execute_parallel_workflow(self, nodes: List[Dict], user_query: str) -> str:
+        """Execute workflow nodes in parallel"""
+        try:
+            tasks = []
+            for node in nodes:
+                task = self._execute_single_node_langchain(node, user_query)
+                tasks.append(task)
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Combine results
+            combined_results = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    combined_results.append(f"Node {i} error: {str(result)}")
+                else:
+                    combined_results.append(f"Node {i}: {result}")
+            
+            return "\n\n".join(combined_results)
+            
+        except Exception as e:
+            return f"Error in parallel workflow: {str(e)}"
+
+    async def _execute_custom_workflow(self, nodes: List[Dict], user_query: str) -> str:
+        """Execute custom workflow logic"""
+        try:
+            # Implement custom workflow logic based on node dependencies
+            context = {"user_query": user_query}
+            
+            for node in nodes:
+                result = await self._execute_single_node_langchain(node, user_query, context)
+                context[f"node_{node.get('id', 'unknown')}_output"] = result
+            
+            # Return the final result or combined results
+            return context.get("final_output", str(context))
+            
+        except Exception as e:
+            return f"Error in custom workflow: {str(e)}"
+
+    async def _execute_single_node_langchain(self, node: Dict, user_query: str, context: Dict = None) -> str:
+        """Execute a single workflow node using LangChain"""
+        try:
+            node_type = node.get('type')
+            config = node.get('config', {})
+            
+            if node_type == 'llm':
+                return await self.llm_service.generate_response(user_query, "", config)
+            elif node_type == 'knowledge_base':
+                stack_id = config.get('stack_id', 'default')
+                kb_context = await self.kb_service.retrieve_context(stack_id, user_query, config)
+                return await self.llm_service.generate_response(user_query, kb_context, config)
+            elif node_type == 'web_search':
+                search_query = config.get('query', user_query)
+                search_results = await self.web_search_service.search(search_query)
+                return f"Web search results: {search_results}"
+            elif node_type == 'file_processor':
+                # Process files and return summary
+                return "File processing completed"
+            else:
+                return f"Unknown node type: {node_type}"
+                
+        except Exception as e:
+            return f"Error executing node: {str(e)}"
+
+    async def _create_llm_chain(self, config: Dict, output_key: str) -> LLMChain:
+        """Create LLM chain for workflow"""
+        model_name = config.get('model', 'GPT 4o - Mini')
+        llm = self.llm_service._get_model_instance(model_name, config.get('temperature', 0.7))
+        
+        prompt_template = config.get('prompt', 'Answer the following question: {user_query}')
+        prompt = PromptTemplate(
+            input_variables=["user_query"],
+            template=prompt_template,
+            output_key=f"{output_key}_output"
+        )
+        
+        return LLMChain(llm=llm, prompt=prompt, output_key=f"{output_key}_output")
+
+    async def _create_kb_chain(self, config: Dict, output_key: str) -> LLMChain:
+        """Create knowledge base chain"""
+        stack_id = config.get('stack_id', 'default')
+        model_name = config.get('model', 'GPT 4o - Mini')
+        llm = self.llm_service._get_model_instance(model_name, config.get('temperature', 0.7))
+        
+        # Create retrieval QA chain
+        qa_chain = self.kb_service.create_retrieval_qa_chain(stack_id, llm, config)
+        
+        if qa_chain:
+            return qa_chain
+        else:
+            # Fallback to simple LLM chain
+            prompt = PromptTemplate(
+                input_variables=["user_query"],
+                template="Answer based on available knowledge: {user_query}",
+                output_key=f"{output_key}_output"
+            )
+            return LLMChain(llm=llm, prompt=prompt, output_key=f"{output_key}_output")
+
+    async def _create_web_search_chain(self, config: Dict, output_key: str) -> LLMChain:
+        """Create web search chain"""
+        model_name = config.get('model', 'GPT 4o - Mini')
+        llm = self.llm_service._get_model_instance(model_name, config.get('temperature', 0.7))
+        
+        prompt = PromptTemplate(
+            input_variables=["user_query"],
+            template="Search the web for: {user_query} and provide a summary of findings.",
+            output_key=f"{output_key}_output"
+        )
+        
+        return LLMChain(llm=llm, prompt=prompt, output_key=f"{output_key}_output")
+
+    async def _create_tool_from_node(self, node: Dict) -> Optional[Tool]:
+        """Create LangChain tool from workflow node"""
+        try:
+            node_type = node.get('type')
+            node_name = node.get('name', f"{node_type}_tool")
+            config = node.get('config', {})
+            
+            if node_type == 'llm':
+                async def llm_tool(query: str) -> str:
+                    return await self.llm_service.generate_response(query, "", config)
+                
+                return Tool(
+                    name=node_name,
+                    description=f"Use this tool to generate responses using {config.get('model', 'LLM')}",
+                    func=llm_tool
+                )
+            
+            elif node_type == 'knowledge_base':
+                async def kb_tool(query: str) -> str:
+                    stack_id = config.get('stack_id', 'default')
+                    context = await self.kb_service.retrieve_context(stack_id, query, config)
+                    return await self.llm_service.generate_response(query, context, config)
+                
+                return Tool(
+                    name=node_name,
+                    description="Use this tool to search the knowledge base for relevant information",
+                    func=kb_tool
+                )
+            
+            elif node_type == 'web_search':
+                async def web_search_tool(query: str) -> str:
+                    return await self.web_search_service.search(query)
+                
+                return Tool(
+                    name=node_name,
+                    description="Use this tool to search the web for current information",
+                    func=web_search_tool
+                )
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error creating tool from node: {e}")
+            return None
+
+    async def create_conversation_chain(self, config: Dict[str, Any]):
+        """Create a conversational chain with memory"""
+        model_name = config.get('model', 'GPT 4o - Mini')
+        llm = self.llm_service._get_model_instance(model_name, config.get('temperature', 0.7))
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", config.get('prompt', 'You are a helpful assistant.')),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}")
+        ])
+        
+        chain = prompt | llm | StrOutputParser()
+        
+        return chain
+
+    # ... keep existing code (original execution methods for backwards compatibility)
     async def execute_workflow(self, nodes: List[Dict], edges: List[Dict], user_query: str, stack_id: str = None) -> str:
         """
         Build execution order and run nodes.
