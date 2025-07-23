@@ -301,20 +301,39 @@ class WorkflowExecutor:
             return f"Error in custom workflow: {str(e)}"
 
     async def _execute_single_node_langchain(self, node: Dict, user_query: str, context: Dict = None) -> str:
-        """Execute a single workflow node using LangChain"""
+        """Execute a single workflow node using LangChain with timeout protection"""
         try:
             node_type = node.get('type')
             config = node.get('config', {})
             
+            # Add timeout protection for each node execution
             if node_type == 'llm':
-                return await self.llm_service.generate_response(user_query, "", config)
+                result = await asyncio.wait_for(
+                    self.llm_service.generate_response(user_query, "", config),
+                    timeout=120  # 2 minute timeout for LLM calls
+                )
+                return result
             elif node_type == 'knowledge_base':
                 stack_id = config.get('stack_id', 'default')
-                kb_context = await self.kb_service.retrieve_context(stack_id, user_query, config)
-                return await self.llm_service.generate_response(user_query, kb_context, config)
+                # Add timeout for knowledge base retrieval
+                kb_context = await asyncio.wait_for(
+                    self.kb_service.retrieve_context(stack_id, user_query, config),
+                    timeout=90  # 90 second timeout for KB retrieval
+                )
+                if "Error" in kb_context:
+                    return kb_context  # Return error directly
+                
+                result = await asyncio.wait_for(
+                    self.llm_service.generate_response(user_query, kb_context, config),
+                    timeout=120  # 2 minute timeout for LLM response
+                )
+                return result
             elif node_type == 'web_search':
                 search_query = config.get('query', user_query)
-                search_results = await self.web_search_service.search(search_query)
+                search_results = await asyncio.wait_for(
+                    self.web_search_service.search(search_query),
+                    timeout=60  # 1 minute timeout for web search
+                )
                 return f"Web search results: {search_results}"
             elif node_type == 'file_processor':
                 # Process files and return summary
@@ -322,8 +341,10 @@ class WorkflowExecutor:
             else:
                 return f"Unknown node type: {node_type}"
                 
+        except asyncio.TimeoutError:
+            return f"Error: Timeout occurred while executing {node_type} node"
         except Exception as e:
-            return f"Error executing node: {str(e)}"
+            return f"Error executing {node_type} node: {str(e)}"
 
     async def _create_llm_chain(self, config: Dict, output_key: str) -> LLMChain:
         """Create LLM chain for workflow"""

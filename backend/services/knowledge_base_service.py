@@ -51,28 +51,56 @@ class KnowledgeBaseService:
             collection_name = self._sanitize_collection_name(f"stack_{stack_id}")
             print(f"[store_embeddings] Using collection: {collection_name}")
 
-            # Create documents from chunks
-            documents = [Document(page_content=chunk) for chunk in chunks]
+            # Limit chunk size to prevent timeout
+            if len(chunks) > 100:
+                print(f"[store_embeddings] Warning: Large number of chunks ({len(chunks)}), processing in batches")
+                chunks = chunks[:100]  # Limit to first 100 chunks
             
-            # Get appropriate embeddings
+            # Filter out empty chunks and limit content length
+            valid_chunks = []
+            for chunk in chunks:
+                if chunk and chunk.strip():
+                    # Limit chunk size to prevent embedding API timeout
+                    if len(chunk) > 8000:  # Reasonable limit for embedding models
+                        chunk = chunk[:8000] + "..."
+                    valid_chunks.append(chunk)
+            
+            if not valid_chunks:
+                print("[store_embeddings] No valid chunks to process")
+                return False
+
+            # Create documents from chunks
+            documents = [Document(page_content=chunk) for chunk in valid_chunks]
+            
+            # Get appropriate embeddings with timeout handling
             embeddings = self._get_embeddings_model(api_key, embedding_model)
             
-            # Create vector store
-            vectorstore = Chroma.from_documents(
-                documents=documents,
-                embedding=embeddings,
-                collection_name=collection_name,
-                persist_directory=self.persist_directory,
-                collection_metadata={
-                    "stack_id": stack_id,
-                    "embedding_model": embedding_model
-                }
-            )
-            
-            # Persist the data
-            vectorstore.persist()
-            print("[store_embeddings] Embeddings stored successfully using LangChain.")
-            return True
+            # Create vector store with timeout protection
+            import asyncio
+            try:
+                vectorstore = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        Chroma.from_documents,
+                        documents=documents,
+                        embedding=embeddings,
+                        collection_name=collection_name,
+                        persist_directory=self.persist_directory,
+                        collection_metadata={
+                            "stack_id": stack_id,
+                            "embedding_model": embedding_model
+                        }
+                    ),
+                    timeout=120  # 2 minute timeout for embedding creation
+                )
+                
+                # Persist the data
+                await asyncio.to_thread(vectorstore.persist)
+                print("[store_embeddings] Embeddings stored successfully using LangChain.")
+                return True
+                
+            except asyncio.TimeoutError:
+                print("[store_embeddings] Timeout error during embedding creation")
+                return False
 
         except Exception as e:
             print(f"[store_embeddings] Error: {e}")
@@ -88,29 +116,45 @@ class KnowledgeBaseService:
             print(f"[retrieve_context] Retrieving context for stack_id: {stack_id}")
             collection_name = self._sanitize_collection_name(f"stack_{stack_id}")
             
-            # Get embeddings model
+            # Get embeddings model with timeout handling
             api_key = config.get("api_key")
             embedding_model = config.get("embedding_model", "text-embedding-3-small")
             embeddings = self._get_embeddings_model(api_key, embedding_model)
             
-            # Load existing vector store
-            vectorstore = Chroma(
-                collection_name=collection_name,
-                embedding_function=embeddings,
-                persist_directory=self.persist_directory
-            )
-            
-            # Perform similarity search
-            docs = vectorstore.similarity_search(query, k=5)
-            
-            if docs:
-                context = "\n\n".join([doc.page_content for doc in docs])
-                return context
-            else:
-                return "No relevant context found in knowledge base."
+            # Load existing vector store with timeout protection
+            import asyncio
+            try:
+                vectorstore = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        Chroma,
+                        collection_name=collection_name,
+                        embedding_function=embeddings,
+                        persist_directory=self.persist_directory
+                    ),
+                    timeout=30  # 30 second timeout for loading vector store
+                )
+                
+                # Perform similarity search with timeout
+                docs = await asyncio.wait_for(
+                    asyncio.to_thread(vectorstore.similarity_search, query, 5),
+                    timeout=60  # 60 second timeout for similarity search
+                )
+                
+                if docs:
+                    context = "\n\n".join([doc.page_content for doc in docs])
+                    return context
+                else:
+                    return "No relevant context found in knowledge base."
+                    
+            except asyncio.TimeoutError:
+                return "Error: Timeout occurred while retrieving context from knowledge base."
+            except Exception as vector_error:
+                print(f"[retrieve_context] Vector store error: {vector_error}")
+                return "Error: Could not access knowledge base. Please ensure embeddings are properly stored."
 
         except Exception as e:
-            return f"[retrieve_context] Error: {e}"
+            print(f"[retrieve_context] Error: {e}")
+            return f"Error embedding content: {str(e)}"
 
     def create_retrieval_qa_chain(self, stack_id: str, llm, config: Dict[str, Any]):
         """Create a RetrievalQA chain for the knowledge base"""
@@ -144,23 +188,32 @@ class KnowledgeBaseService:
             return None
 
     def _get_embeddings_model(self, api_key: Optional[str], embedding_model: str):
-        """Get the appropriate embeddings model"""
-        if "openai" in embedding_model.lower() or "text-embedding" in embedding_model:
-            return OpenAIEmbeddings(
-                api_key=api_key or self.openai_api_key,
-                model=embedding_model
-            )
-        elif "gemini" in embedding_model.lower() or "embedding-001" in embedding_model:
-            return GoogleGenerativeAIEmbeddings(
-                google_api_key=api_key or self.google_api_key,
-                model="models/embedding-001"
-            )
-        else:
-            # Default to OpenAI
-            return OpenAIEmbeddings(
-                api_key=api_key or self.openai_api_key,
-                model="text-embedding-3-small"
-            )
+        """Get the appropriate embeddings model with timeout configuration"""
+        try:
+            if "openai" in embedding_model.lower() or "text-embedding" in embedding_model:
+                return OpenAIEmbeddings(
+                    api_key=api_key or self.openai_api_key,
+                    model=embedding_model,
+                    request_timeout=60,  # 60 second timeout
+                    max_retries=3
+                )
+            elif "gemini" in embedding_model.lower() or "embedding-001" in embedding_model:
+                return GoogleGenerativeAIEmbeddings(
+                    google_api_key=api_key or self.google_api_key,
+                    model="models/embedding-001",
+                    request_timeout=60  # 60 second timeout
+                )
+            else:
+                # Default to OpenAI with timeout
+                return OpenAIEmbeddings(
+                    api_key=api_key or self.openai_api_key,
+                    model="text-embedding-3-small",
+                    request_timeout=60,
+                    max_retries=3
+                )
+        except Exception as e:
+            print(f"Error creating embeddings model: {e}")
+            raise
 
     async def process_documents_from_files(self, file_paths: List[str]) -> List[Document]:
         """Process documents from files using LangChain loaders"""
