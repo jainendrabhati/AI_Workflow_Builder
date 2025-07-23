@@ -106,7 +106,15 @@ class LLMService:
                     temperature=temperature
                 )
         
-        # Default fallback
+        # Check model name to determine correct provider for fallback
+        if 'gemini' in model_name.lower() or 'flash' in model_name.lower():
+            return ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash",
+                google_api_key=api_key or self.gemini_api_key,
+                temperature=temperature
+            )
+        
+        # Default fallback to OpenAI
         return ChatOpenAI(
             model="gpt-4o-mini",
             api_key=api_key or self.openai_api_key,
